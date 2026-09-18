@@ -996,7 +996,16 @@ MOA+8:12.50'
   finds there.
 - The **plugin** changes this substantially — see [7.8](#78-plugin-behavior-differences). It
   sums only the specific `MOA` qualifiers you opt into (8, 79, 124, 131, 304) and scans the
-  whole message rather than just the header.
+  whole message rather than just the header. The `ALC` plays no part in whether an amount is
+  picked up.
+
+**What this means for a supplier.** The qualifier is what the library configures against, so
+give each kind of charge its own `MOA` qualifier wherever the standard allows it. Where that
+isn't possible and several charges have to share one qualifier, `MOA+8` being the usual case,
+put a stable code in a fixed position of the `ALC` in front of each amount, and tell the
+library which codes you will send and which element they sit in. The plugin can then filter
+on that code and keep the charges apart. Codes that move between invoices, or charges that
+share a qualifier with nothing to tell them apart, cannot be separated.
 
 ### 7.4 Line-level elements
 
@@ -1229,13 +1238,18 @@ changes these behaviors:
 - **Standing orders** always receive as a partial (keeping one copy remaining) so the
   standing order stays open.
 - **Shipment charge is opt-in per `MOA` qualifier** (`shipment_charges_moa_8` / `_79` /
-  `_124` / `_131` / `_304`, plus `shipment_charges_alc_dl`), and the plugin scans the whole
-  message, not just the header. `add_tax_to_shipping_costs` adds the vendor tax rate to the
-  total. In the example above, the header `MOA+8:9.00` is only included in shipment cost if
-  `shipment_charges_moa_8` is enabled.
+  `_124` / `_131` / `_304`), and the plugin scans the whole message, not just the header. An
+  `ALC` is not required for an amount to be seen; the qualifier alone decides.
+  `add_tax_to_shipping_costs` adds the vendor tax rate to the total. In the example above,
+  the header `MOA+8:9.00` is only included in shipment cost if `shipment_charges_moa_8` is
+  enabled. Each option is all or nothing for its qualifier, so enabling
+  `shipment_charges_moa_8` takes in every `MOA+8` in the message whatever charge it stands
+  for.
 - **Invoice adjustments from MOA.** If `invoice_adjustment_rules` are configured, the plugin
-  reads every message-level `MOA` and creates `aqinvoice_adjustments` for the qualifiers
-  named in the rules.
+  reads every `MOA` in the message and creates `aqinvoice_adjustments` for the qualifiers
+  named in the rules. A rule can also filter on the segments governing the amount, so several
+  charges sharing one qualifier can be told apart by the `ALC` in front of each, and a rule
+  can route its amounts to the invoice shipping cost instead of an adjustment.
 - **Item receipt** is done by the plugin's own `_receipt_items`, which additionally sets the
   item's `booksellerid` (source of acquisition), `dateaccessioned`, and (per config)
   `price`/`replacementprice`, a not-for-loan value (`set_nfl_on_receipt`), an

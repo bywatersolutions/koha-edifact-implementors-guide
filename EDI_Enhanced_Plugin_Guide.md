@@ -19,7 +19,7 @@ For the standard Koha EDIFACT specification, see the companion document [EDI Sup
   - [4.5 GIR Segments — Copy-Level Data](#45-gir-segments--copy-level-data)
   - [4.6 Other Order Options](#46-other-order-options)
   - [4.7 Invoice Processing Options](#47-invoice-processing-options)
-  - [4.8 Shipment Charge Configuration](#48-shipment-charge-configuration)
+  - [4.8 Shipment Charges and Invoice Adjustments](#48-shipment-charges-and-invoice-adjustments)
   - [4.9 Item Receipt Options](#49-item-receipt-options)
 - [5. Changes from Standard Koha Behavior](#5-changes-from-standard-koha-behavior)
   - [5.1 Order Message (ORDERS) Differences](#51-order-message-orders-differences)
@@ -282,13 +282,14 @@ Standard EDIFACT limits a GIR segment to 5 data pairs. If a copy needs more, con
 | `update_pricing_from_vendor_settings` | After setting prices from invoice data, recalculate using the vendor's tax configuration. Uses `populate_with_prices_for_ordering()` and `populate_with_prices_for_receiving()`. |
 | `close_invoice_on_receipt` | Automatically close (set `closedate`) on the invoice when processing completes. |
 
-### 4.8 Shipment Charge Configuration
+### 4.8 Shipment Charges and Invoice Adjustments
 
-Standard Koha sums all MOA (monetary amount) segments found in message-level ALC+C (charge) segments before the first LIN line item. The plugin provides granular control over which amounts are included in shipping costs.
+Standard Koha sums all MOA (monetary amount) segments found in message-level ALC+C (charge) segments before the first LIN line item. The plugin keys on the MOA qualifier instead. An ALC is not required for an amount to be picked up, and the **entire** message is scanned, not just the segments before the first LIN.
+
+#### Shipment Charge Configuration
 
 | Setting | Description |
 |---------|-------------|
-| `shipment_charges_alc_dl` | Include ALC+DL (delivery charge) amounts. Standard Koha always includes these. |
 | `shipment_charges_moa_8` | Include MOA qualifier 8 (allowance/charge amount — often used for value-added services like barcoding and lamination) |
 | `shipment_charges_moa_79` | Include MOA qualifier 79 (total line items amount) |
 | `shipment_charges_moa_124` | Include MOA qualifier 124 (tax amount) |
@@ -298,7 +299,40 @@ Standard Koha sums all MOA (monetary amount) segments found in message-level ALC
 | `shipping_budget_id` | Static budget ID for shipping costs (overrides the vendor EDI account's `shipment_budget` setting) |
 | `ship_budget_from_orderline` | Use the budget from the last processed order line as the shipping cost budget |
 
-**Note:** Unlike standard Koha, the plugin scans the **entire** message for charge segments, not just those before the first LIN segment.
+**Note:** Each checkbox is all or nothing for its qualifier. Enabling `shipment_charges_moa_8` adds **every** `MOA+8` in the message to the shipping cost, whatever charge it stands for. When a vendor sends several different charges under one qualifier, leave the checkbox off and use a filtered adjustment rule with **Shipping** ticked instead.
+
+#### Invoice Adjustments from MOA Segments
+
+Rules under *Invoice Adjustments from MOA Segments* create `aqinvoice_adjustments` from the MOA amounts in an invoice. Each rule matches a MOA qualifier; any qualifier can be used, not only the five offered as shipment charges. Reason (an `ADJ_REASON` authorized value), note, budget ID and encumber-while-open are set per rule.
+
+A qualifier alone often can't tell two charges apart. A vendor may send every value-added charge as `MOA+8`, with only the preceding `ALC` saying which charge it is:
+
+```edifact
+ALC+C++6++C&P'
+MOA+8:397.50'
+ALC+C++6++JKT'
+MOA+8:77.76'
+```
+
+Add filters to a rule to match on the segments governing the MOA as well as its qualifier. A rule with no filters matches on the qualifier alone, and where a rule has several filters all of them must match.
+
+| Field | Meaning |
+|-------|---------|
+| Segment | A segment tag such as `ALC`, `TAX`, `PAT`, `AJT`, `FTX` or `RFF`; `MOA` for the amount segment itself (element `0.0` is the qualifier, `0.1` the amount, `0.2` the currency); or one of the pseudo-fields `section` (`header`, `line` or `summary`), `line` or `currency`. |
+| Element | A position within that segment, such as `4` or `4.0`. Leave it empty to test the value against every part of the segment, which is what you want when a vendor doesn't put the code where the standard says it goes. |
+| Operator | `=`, `!=`, `contains` or `matches regex`. `!=` passes when nothing in the segment matches, so it also passes when the segment isn't there at all. |
+| Value | Compared ignoring case and surrounding spaces. |
+
+Tick **Shipping** on a rule to add its matched amounts to the invoice shipping cost instead of creating an adjustment. This is how a freight charge buried under a shared `MOA+8` gets into the shipping cost while the other charges under that qualifier become adjustments. The reason, note, budget and encumber fields don't apply to a shipping rule.
+
+For the four charges a vendor might send on one invoice, four rules each filtering `ALC` / `4.0` / `=` on its own code put each charge on its own adjustment against its own fund:
+
+| MOA Qualifier | Filter | Reason | Budget ID |
+|---------------|--------|--------|-----------|
+| 8 | `ALC` `4.0` `=` `C&P` | Cataloging | 12 |
+| 8 | `ALC` `4.0` `=` `JKT` | Supplies | 14 |
+| 8 | `ALC` `4.0` `=` `RFI` | Supplies | 14 |
+| 8 | `ALC` `4.0` `=` `LFG` | Supplies | 14 |
 
 ### 4.9 Item Receipt Options
 
@@ -351,6 +385,8 @@ The plugin **completely replaces** standard Koha invoice processing. Key behavio
 | **Duplicate invoices** | Creates a new invoice each time | Searches for existing invoice by number+vendor, updates if found |
 | **Vendor routing** | Uses EDI message vendor ID | Can re-route based on SAN matching or order basket vendor |
 | **Cross-vendor matching** | Rejects if order vendor ≠ invoice vendor | Allows if both vendor accounts use the same plugin class |
+| **Shipment charge detection** | MOA amounts under a message-level `ALC+C` before the first LIN | Opt-in per MOA qualifier, whole message scanned, no `ALC` required |
+| **Invoice adjustments** | Not created from EDI | Optional: rules create adjustments from MOA amounts, filtered on the segments governing each amount |
 | **Tax on shipping** | Not calculated | Optional: adds vendor tax rate to shipping charge |
 | **Shipping budget** | From vendor EDI account setting | Configurable: static ID, from order line, or vendor account setting |
 | **Standing orders** | Not specifically handled | Creates partial receipt keeping `quantity_remaining = 1` to keep order open |
@@ -535,7 +571,11 @@ GIR+1+001:LLO+ADULT-NF:LFN+BOOK:LST+REFERENCE:LSQ+823.914:LSM'
 
 **Symptom:** Invoice shipping charges are zero or incorrect.
 
-**Explanation:** The plugin requires explicit opt-in for each MOA qualifier that should be included in shipping charges. Verify that the appropriate `shipment_charges_*` options are enabled for the qualifiers your vendor uses. Check the raw EDIFACT message to identify which MOA qualifiers the vendor sends at the message level.
+**Explanation:** The plugin requires explicit opt-in for each MOA qualifier that should be included in shipping charges. Verify that the appropriate `shipment_charges_moa_*` options are enabled for the qualifiers your vendor uses. Check the raw EDIFACT message to identify which MOA qualifiers the vendor sends. The `ALC` in front of an amount has no bearing on whether it is picked up.
+
+**Symptom:** Shipping is too high, and includes charges that are not shipping.
+
+**Explanation:** A `shipment_charges_moa_*` option takes in every amount under that qualifier. If the vendor sends shipping and value-added charges under one qualifier, turn the option off and add a filtered adjustment rule with **Shipping** ticked for the shipping charge alone (see [4.8](#48-shipment-charges-and-invoice-adjustments)).
 
 ### Configuration Changes Not Logged
 
