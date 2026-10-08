@@ -4,6 +4,8 @@ This document describes the **EDIFACT Enhanced Plugin** for Koha, developed by B
 
 For the standard Koha EDIFACT specification, see the companion document [EDI Supplier Guide](EDI_Supplier_Guide.md).
 
+This guide describes plugin **4.5.1** running on Koha **25.11 or later**, checked against the plugin source and Koha main (26.06). Where core Koha has since gained a feature the plugin implements separately, or the plugin has not kept up with a core change, that is noted in [Section 5](#5-changes-from-standard-koha-behavior) and [Section 9](#9-core-changes-the-plugin-does-not-follow).
+
 ---
 
 ## Table of Contents
@@ -13,7 +15,7 @@ For the standard Koha EDIFACT specification, see the companion document [EDI Sup
 - [3. How the Plugin Integrates with Koha](#3-how-the-plugin-integrates-with-koha)
 - [4. Configuration Reference](#4-configuration-reference)
   - [4.1 Buyer Identification](#41-buyer-identification)
-  - [4.2 File Suffixes](#42-file-suffixes)
+  - [4.2 File Suffixes and File Handling](#42-file-suffixes-and-file-handling)
   - [4.3 LIN Segment — Line Item Identification](#43-lin-segment--line-item-identification)
   - [4.4 PIA Segments — Additional Product Identifiers](#44-pia-segments--additional-product-identifiers)
   - [4.5 GIR Segments — Copy-Level Data](#45-gir-segments--copy-level-data)
@@ -29,41 +31,39 @@ For the standard Koha EDIFACT specification, see the companion document [EDI Sup
 - [6. Vendor-Specific Features](#6-vendor-specific-features)
 - [7. YAML Configuration Examples](#7-yaml-configuration-examples)
 - [8. Troubleshooting](#8-troubleshooting)
+- [9. Core Changes the Plugin Does Not Follow](#9-core-changes-the-plugin-does-not-follow)
 
 ---
 
 ## 1. Overview
 
-The EDIFACT Enhanced Plugin replaces four key components of Koha's EDI pipeline when enabled on a vendor EDI account:
+The EDIFACT Enhanced Plugin replaces four components of Koha's EDI pipeline when enabled on a vendor EDI account:
 
-| Component | Standard Koha | Plugin Replacement |
-|-----------|--------------|-------------------|
-| Order generation | `Koha::Edifact::Order` | `EdifactEnhanced::Edifact::Order` |
-| EDIFACT parsing | `Koha::Edifact` | `EdifactEnhanced::Edifact` |
-| File transport | `Koha::Edifact::Transport` | `EdifactEnhanced::Edifact::Transport` |
-| Invoice processing | `Koha::EDI::process_invoice` | `EdifactEnhanced::edifact_process_invoice` |
+| Component | Standard Koha | Plugin Replacement | Used for |
+|-----------|--------------|-------------------|----------|
+| Order generation | `Koha::Edifact::Order` | `EdifactEnhanced::Edifact::Order` | All orders to this vendor |
+| EDIFACT parsing | `Koha::Edifact` | `EdifactEnhanced::Edifact` | **Invoices only** |
+| File transport | `Koha::Edifact::Transport` | `EdifactEnhanced::Edifact::Transport` | **Invoice download only** |
+| Invoice processing | `Koha::EDI::process_invoice` | `EdifactEnhanced::edifact_process_invoice` | Invoices |
 
-The plugin does **not** create any custom database tables. All settings are stored in Koha's standard `plugin_data` table.
+Quote and order response handling (download, parsing and processing) and order *upload* always use core Koha.
+
+The plugin does **not** create any custom database tables. All settings are stored in Koha's standard `plugin_data` table, which means the configuration is **global**: every vendor EDI account that has the plugin selected uses the same settings. The plugin is switched on or off per account, but it cannot be configured differently per account. (The only per-account switches are the `NO_GIR:{True}` marker in a Library EAN description and the choice of Library EAN itself.)
 
 ---
 
 ## 2. Installation and Requirements
 
-**Minimum Koha version:** 22.05.06
+**Minimum Koha version:** 25.11.00 (plugin 4.x; the plugin uses the file transport records introduced in 25.11)
 
-**Required Perl module:**
-```
-Business::Barcode::EAN13
-```
-
-This module is used for EAN-13 validation when resolving product identifiers for the LIN segment.
+**Required Perl modules:** none beyond Koha's own. (Versions before 4.4.2 required `Business::Barcode::EAN13`; the EAN-13 check digit is now computed inside the plugin.)
 
 **Installation steps:**
 1. Install the plugin via the Koha plugin manager (upload the `.kpz` file)
 2. Navigate to the plugin's configuration page to set options
 3. On each vendor EDI account that should use the plugin, set the **Plugin** field to `Koha::Plugin::Com::ByWaterSolutions::EdifactEnhanced`
 
-The plugin is activated **per vendor EDI account**, not globally. Different vendors can use different configurations or no plugin at all.
+The plugin is activated **per vendor EDI account**, not globally: a vendor account can use this plugin or none. All accounts that use it share one configuration (see [Section 1](#1-overview)).
 
 ---
 
@@ -71,12 +71,11 @@ The plugin is activated **per vendor EDI account**, not globally. Different vend
 
 When a vendor EDI account has this plugin configured, Koha's standard EDI code checks for plugin methods at each stage of processing:
 
-1. **Sending orders:** Koha calls the plugin's `edifact_order()` method instead of creating a standard `Koha::Edifact::Order` object.
-2. **Downloading files:** Koha calls the plugin's `edifact_transport()` method instead of using the standard transport.
-3. **Parsing incoming messages:** Koha calls the plugin's `edifact()` method instead of the standard parser.
-4. **Processing invoices:** Koha calls the plugin's `edifact_process_invoice()` method, which **completely replaces** the standard `Koha::EDI::process_invoice` pipeline.
+1. **Sending orders:** Koha calls the plugin's `edifact_order()` method instead of creating a standard `Koha::Edifact::Order` object. The file is then uploaded by core's transport.
+2. **Downloading invoices:** `edi_cron.pl` calls the plugin's `edifact_transport()` method to download **invoice** files. Quote and order response files are always downloaded by the core transport.
+3. **Processing invoices:** Koha calls the plugin's `edifact_process_invoice()` method, which **completely replaces** the standard `Koha::EDI::process_invoice` pipeline. The plugin's own invoice processor then calls the plugin's `edifact()` method to obtain its parser. (Core only calls `edifact()` itself when a plugin has no `edifact_process_invoice`.)
 
-Quote and order response processing continue to use the standard Koha pipeline, but use the plugin's parser for reading the EDIFACT data.
+Quote and order response processing (download, parsing and processing) are **entirely core Koha**; the plugin's parser is not involved, so the parsing differences in [Section 5.2](#52-incoming-message-parsing-differences) apply to invoices only.
 
 ---
 
@@ -94,15 +93,16 @@ These settings control how the library identifies itself in outgoing ORDERS mess
 |---------|-------------|
 | `buyer_san` | A static SAN value to send as the buyer identifier |
 | `buyer_id_code_qualifier` | The qualifier for the buyer identifier: `14` (EAN), `31B` (US SAN), `91` (supplier-assigned), `92` (buyer-assigned) |
-| `buyer_san_in_header` | Enable sending the buyer SAN in the UNB interchange header |
-| `branch_ean_in_header` | Enable sending the Library EAN in the UNB header (standard behavior) |
+| `buyer_san_in_header` | Enable sending the buyer SAN in the UNB interchange header. When it is off, or no SAN can be found, the Library EAN is sent (standard behavior) |
+
+(An earlier `branch_ean_in_header` option was removed in 4.4.6: it was stored but never read.)
 
 When `buyer_san_in_header` is enabled, the plugin offers three alternative sources for the SAN value (checked in this priority order):
 
 | Setting | Behavior |
 |---------|----------|
 | `buyer_san_extract_from_library_ean_description` | Extracts a SAN from the Library EAN's description field using the pattern `SAN:{value}` |
-| `buyer_san_use_username` | Uses the vendor EDI account's username as the buyer identifier |
+| `buyer_san_use_username` | Uses the **file transport's** user name as the buyer identifier (a warning is logged if the account has no file transport or no user name) |
 | `buyer_san_use_library_ean_split_first_part` | Splits the Library EAN on spaces and uses only the first part |
 
 If none of these alternative sources are enabled, the static `buyer_san` value is used.
@@ -114,7 +114,7 @@ If none of these alternative sources are enabled, the static `buyer_san` value i
 | `buyer_san_in_nadby` | Include a NAD+BY segment with the buyer SAN |
 | `branch_ean_in_nadby` | Include a NAD+BY segment with the Library EAN |
 
-These are independent — you can have zero, one, or two NAD+BY segments. Standard Koha always sends exactly one.
+These are independent — you can have zero, one, or two NAD+BY segments. Standard Koha always sends exactly one. The SAN in `NAD+BY` is the same value as in the header, whichever of the sources above supplies it (before 4.5.1 it was omitted unless typed into `buyer_san`, so some vendors rejected the order).
 
 **Example:** A library with SAN `1234567` and EAN `9876543210123` could produce:
 
@@ -125,14 +125,33 @@ NAD+BY+1234567::31B'
 NAD+BY+9876543210123::9'
 ```
 
-### 4.2 File Suffixes
+#### Order Contact and Addresses
+
+*(Since 4.4.0.)* Some vendors (Amazon Business, for example) need to know who is ordering and where to deliver.
+
+| Setting | Description |
+|---------|-------------|
+| `order_contact_name` | Name sent in `CTA+OC` |
+| `order_contact_email` | Email sent in `COM+...:EM` |
+| `send_shipto_address` / `shipto_address_qualifier` | Send a ship-to `NAD` built from the basket's delivery library (or the Library EAN's branch if the basket has none). Qualifier defaults to `DP`; `ST` is also used |
+| `send_billto_address` / `billto_address_qualifier` | Send a bill-to `NAD` from the basket's billing library. Qualifier defaults to `IV`; `BT` is also used |
+
+The address `NAD` carries the library name, street, city, state, postcode and country. Because EDIFACT D96A only allows `CTA` and `COM` inside a `NAD` group (4.5.0), they follow each ship-to and bill-to `NAD`, or the buyer `NAD` segments when neither address is sent.
+
+### 4.2 File Suffixes and File Handling
 
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `order_file_suffix` | File extension appended to outgoing order files | None (standard Koha uses `.CEP`) |
-| `invoice_file_suffix` | File extension for matching incoming invoice files during download | None (standard Koha uses `.CEI`) |
+| `invoice_file_suffix` | File extension for matching incoming **invoice** files during download (case-insensitive) | None, which matches every file (standard Koha uses `.CEI`) |
+| `append_processed_file_suffix` | After downloading, mark the file on the server by appending `.dl` instead of changing the first character of the extension to `E` | Off |
+| `skip_previously_downloaded_files` | Do not download a file whose name is already in `edifact_messages` | On |
 
-If `order_file_suffix` is set to e.g. `edi`, outgoing files will be named `ordr{basketno}.edi`. If left blank, no extension is appended.
+If `order_file_suffix` is set to e.g. `edi`, outgoing files will be named `ordr{basketno}.edi`. If left blank, no extension is appended. A leading period in either suffix setting is removed. The `.` and `..` directory entries are ignored when downloading, and the "mark as processed" rename is skipped when it would not change the name (some SFTP servers reject such a rename).
+
+Uploads, and all quote and order response downloads, use the core transport, so these settings do not affect them.
+
+Every download and upload is recorded in the action log under module `EDIFACT` (`MESSAGE_DOWNLOAD`, `MESSAGE_UPLOAD_ATTEMPT`, `MESSAGE_UPLOAD_COMPLETE`, `MESSAGE_UPLOAD_FAILED`).
 
 ### 4.3 LIN Segment — Line Item Identification
 
@@ -143,6 +162,7 @@ The LIN segment identifies the product being ordered. Standard Koha uses only th
 | Priority | Setting | Source | Qualifier |
 |----------|---------|--------|-----------|
 | 1 | `lin_use_item_field` | Any column from the Koha `items` table | Configurable via `lin_use_item_field_qualifier` |
+| 1b | `lin_use_marc_field` | A MARC field and subfield from the record, e.g. `037$a` *(4.4.6)* | Configurable via `lin_use_marc_field_qualifier` |
 | 2 | *(default)* | `line_item_id` from the order line | `EN` |
 | 3 | `lin_use_ean` | EAN from biblioitem data, validated with `Business::Barcode::EAN13` | `EN` |
 | 4 | `lin_use_issn` | ISSN from biblioitem data | `IS` |
@@ -179,12 +199,15 @@ Standard Koha generates at most one PIA segment per line item. The plugin can ge
 | `pia_use_isbn13` | All ISBN-13s from the record | `EN` |
 | `pia_use_upc` | UPC from MARC 024$a | `UP` |
 | `pia_use_product_id` | Product ID from MARC 028$a | `PI` |
+| `pia_marc_fields` | YAML list of MARC field/subfield and qualifier pairs, e.g. an Amazon ASIN in `037$a` *(4.4.6)* | As configured |
+
+PIA identifiers from `pia_marc_fields` are sent first, so they are not starved by `pia_limit`. Each of `pia_use_isbn10` and `pia_use_isbn13` controls only its own identifier type (before 4.4.6 the ISBN-13 box was wrongly governed by the ISBN-10 one, so installs that relied on that must tick both).
 
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `pia_limit` | Maximum number of PIA segments per order line | 25 |
 
-These options are **not** mutually exclusive — enabling multiple options generates multiple PIA segments. The first PIA uses function code `5` (product identification) if no LIN identifier was found; subsequent PIAs use function code `1` (additional identification).
+These options are **not** mutually exclusive — enabling multiple options generates multiple PIA segments. When the LIN carried an identifier, every PIA uses function code `1` (additional identification). When it did not, the first PIA uses function code `5` (product identification) and the rest use `1`. An identifier already sent in the LIN is not repeated.
 
 ### 4.5 GIR Segments — Copy-Level Data
 
@@ -204,16 +227,18 @@ You can also disable GIR per Library EAN by adding `NO_GIR:{True}` to the Librar
 |---------|-------------|
 | `gir_mapping` | YAML map that replaces the default GIR field mapping |
 
-The default Koha GIR mapping is:
+The plugin's default GIR mapping (used when `gir_mapping` is empty) is, in the order emitted:
 
 | Qualifier | Data Source |
 |-----------|------------|
-| `LLO` | `homebranch` (items table) |
 | `LFN` | `budget_code` (from aqbudgets) |
+| `LLO` | `homebranch` (items table) |
 | `LST` | `itype` (items table) |
-| `LSQ` | Item field from `EdifactLSQ` syspref |
+| `LSQ` | the item's `location`. **This is hard-coded**: the plugin does not read the `EdifactLSQ` preference that core Koha uses |
 | `LSM` | `itemcallnumber` (items table) |
-| `LVT` | `servicing_instruction` (vendor note) |
+| `LVT` | the order line's **vendor note** (`order_vendornote`) |
+
+This differs from core Koha, which also sends `LSL` (from `EdifactLSL`), takes `LVT` and `LVC` from the order line's servicing instructions, and emits the qualifiers in a different order (see [Section 9](#9-core-changes-the-plugin-does-not-follow)). Because the plugin sends the vendor note as `LVT`, it does not send `FTX+LIN` for it. When the basket does not create items at ordering, only `LLO`, `LST` and `LSM` are sent, from the basket and the record.
 
 The custom mapping can reference:
 
@@ -221,7 +246,7 @@ The custom mapping can reference:
 |------------|--------|---------|
 | Items table column | `column_name` | `homebranch`, `itype`, `location` |
 | Budget code | `budget_code` | `budget_code` |
-| Vendor note | `servicing_instruction` | `servicing_instruction` |
+| Vendor note | `servicing_instruction` | `servicing_instruction` (the value of `order_vendornote`) |
 | Any aqorders column | `aqorders.column` | `aqorders.sort1` |
 | Literal string | `\value` | `\BOOK` |
 | MARC field/subfield | `{field}${subfield}` | `082$a` |
@@ -260,15 +285,15 @@ LLO:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `split_gir` | Number of qualifier+value pairs per GIR segment line | 5 (standard Koha behavior) |
+| `split_gir` | Number of qualifier+value pairs per GIR segment line | 4 on the configuration form (core Koha uses 5) |
 
-Standard EDIFACT limits a GIR segment to 5 data pairs. If a copy needs more, continuation GIR segments are emitted with the same copy sequence number. Setting this to `0` puts all data in a single GIR segment (no splitting). Values 1–20 are supported.
+Standard EDIFACT limits a GIR segment to 5 data pairs. If a copy needs more, continuation GIR segments are emitted with the same copy sequence number. Setting this to `0` puts all data in a single GIR segment (no splitting). Splitting applies to a custom `gir_mapping`; the built-in default mapping is always a single `GIR` segment, which holds six pairs when the order line has a vendor note (`LVT` is appended after the five mapped pairs). Suppliers that enforce the five-pair limit of the `GIR` segment need a custom `gir_mapping`.
 
 ### 4.6 Other Order Options
 
 | Setting | Description |
 |---------|-------------|
-| `send_basketname` | Send the basket name instead of the basket number in the BGM segment. Useful when the basket name carries a meaningful purchase order number. |
+| `send_basketname` | Send the basket name instead of the basket number in the BGM segment. Useful when the basket name carries a meaningful purchase order number. This is the plugin's own global switch: it does **not** read the vendor account's *Use purchase order numbers* setting that core Koha now uses for the same purpose, and the name is not escaped (see [Section 9](#9-core-changes-the-plugin-does-not-follow)). |
 | `send_rff_bfn` | Include an `RFF+BFN:{budget_code}` segment per order line (the budget/fund code). Not generated by standard Koha. |
 | `send_rff_bfn_biblionumber` | Include an `RFF+BFN:{biblionumber}` segment per order line (the Koha bibliographic record number). Not generated by standard Koha. |
 
@@ -277,8 +302,8 @@ Standard EDIFACT limits a GIR segment to 5 data pairs. If a copy needs more, con
 | Setting | Description |
 |---------|-------------|
 | `set_bookseller_from_order_basket` | Determine the vendor from the order's basket rather than the EDI message's vendor ID. Useful when multiple vendor EDI accounts point to the same physical vendor. |
-| `skip_nonmatching_san_suffix` | If the supplier SAN in the EDIFACT message does not match the vendor EDI account's SAN, skip processing and attempt to re-route the message to the correct account. |
-| `ignore_duplicate_reciepts` | Skip order lines that are already fully received (`quantity == quantityreceived`) instead of attempting to re-receipt them. |
+| `skip_nonmatching_san_suffix` | If the supplier SAN in the EDIFACT message does not match the vendor EDI account's SAN, attempt to re-route the message to the account whose SAN matches (setting it back to `new`), or leave it at `new` if none matches. |
+| `ignore_duplicate_reciepts` | Skip order lines that are already fully received (`quantity == quantityreceived`) instead of attempting to re-receipt them. Applies only when the line would be a full receipt, not a part receipt. |
 | `update_pricing_from_vendor_settings` | After setting prices from invoice data, recalculate using the vendor's tax configuration. Uses `populate_with_prices_for_ordering()` and `populate_with_prices_for_receiving()`. |
 | `close_invoice_on_receipt` | Automatically close (set `closedate`) on the invoice when processing completes. |
 
@@ -336,7 +361,9 @@ For the four charges a vendor might send on one invoice, four rules each filteri
 
 ### 4.9 Item Receipt Options
 
-These settings control how items are updated when they are received via an EDIFACT invoice.
+These settings control how items are updated when they are received via an EDIFACT invoice. The plugin updates up to the invoiced quantity of the items linked to the received order; unlike core Koha it does not match items by `GIR` branch and does not assign barcodes from `GIR+LAC`.
+
+Always applied: `dateaccessioned` is set to today and `booksellerid` to the basket's vendor.
 
 | Setting | Values | Description |
 |---------|--------|-------------|
@@ -356,25 +383,28 @@ These settings control how items are updated when they are received via an EDIFA
 | **File extension** | Always `.CEP` | Configurable via `order_file_suffix`, or no extension |
 | **UNB sender ID** | Always Library EAN | Configurable: SAN, username, partial EAN, or extracted from description |
 | **NAD+BY segments** | Exactly one (Library EAN) | Zero, one, or two (SAN and/or EAN independently) |
-| **BGM document number** | Basket number (zero-padded to 11 digits) or basket name with `po_is_basketname` | Basket number or basket name via `send_basketname` |
+| **BGM document number** | Basket number (zero-padded to 11 digits) or, with the account's `po_is_basketname`, the basket name (escaped) | Basket number or, with the global `send_basketname`, the basket name (not escaped; the account setting is ignored) |
+| **BGM document type** | `220`, or `22V` after a quote for a `BIC` vendor | Always `220` |
 | **LIN identifier** | `line_item_id` only, qualifier `EN` | Configurable priority cascade across 7 sources with per-source qualifiers |
 | **PIA segments** | At most one, single ISBN | Multiple segments, multiple identifier types, configurable limit |
-| **GIR mapping** | Fixed field mapping | Fully customizable via YAML, with value replacement |
-| **GIR splitting** | Hardcoded at 5 pairs | Configurable 0–20 |
-| **GIR disabling** | Not possible | Global toggle or per-account via EAN description |
-| **FTX segments** | Sends vendor notes as `FTX+LIN` | Does **not** generate FTX segments |
+| **GIR mapping** | Fixed mapping: `LFN`, `LLO`, `LST`, `LSQ` (`EdifactLSQ`), `LSL` (`EdifactLSL`), `LSM`, then `LVC`/`LVT` servicing instructions | Fixed default (`LFN`, `LLO`, `LST`, `LSQ` from `location`, `LSM`, `LVT` from the vendor note) or fully customizable via YAML, with value replacement; no `LSL` or `LVC` |
+| **GIR splitting** | Hardcoded at 5 pairs | Configurable (default 4) for a custom mapping; the default mapping is not split |
+| **GIR disabling** | Not possible | Global toggle, or per Library EAN via its description |
+| **FTX segments** | Sends vendor notes as `FTX+LIN` | Does **not** generate FTX segments (the vendor note is sent as `GIR+LVT` instead) |
+| **Contact and addresses** | Not sent | Optional `CTA+OC`, `COM`, ship-to and bill-to `NAD` |
 | **RFF+BFN** | Not generated | Optional: budget code or biblionumber |
-| **Smart quote handling** | Not handled | Converts Unicode right single quotes (U+2019) to ASCII apostrophes before escaping |
+| **Smart quote handling** | Not handled: transliteration of the finished message turns U+2019 into an unescaped `'` (core bug 41789) | Converts Unicode right single quotes (U+2019) to ASCII apostrophes before escaping |
 
 ### 5.2 Incoming Message Parsing Differences
 
 | Feature | Standard Koha | Plugin |
 |---------|--------------|--------|
-| **Missing UNA segment** | Fatal error (croak) | Warning only (carp), attempts to parse anyway |
-| **Line breaks in messages** | Not handled | Strips leading whitespace and non-printable characters from segments |
+| **Syntax version 4 UNA** (`UNA:+.?*'`) | Rejected: the file parses to zero messages and is marked received without an error (core bug 43757) | Accepted: the fifth character (reserved in syntax 3, repetition separator in syntax 4) is ignored |
+| **Missing UNA segment** | Fatal error (croak), which currently ends the whole cron run (core bug 43757) | Warning only (carp); parses assuming the printable default separators |
+| **Whitespace between segments** | Not handled | Strips leading whitespace and non-printable characters from segments |
 | **Non-printable characters** | Preserved in element values | Stripped from all element values at access time |
 
-These parsing improvements address a known issue where some vendors insert line break characters every 80 characters in their EDIFACT output. **If you are experiencing parse errors with vendor messages, ask the vendor to disable line-break insertion.** The plugin handles this gracefully, but clean messages are preferred.
+These differences apply to **invoices only**; quotes and order responses are always parsed by core. A missing `UNA` is not strictly permitted for `UNOC`: ISO 9735 makes the default separators for character sets above `UNOA`/`UNOB` non-printable, so a sender using printable separators must include `UNA`. The plugin's behaviour is a leniency, and line breaks are not allowed in an interchange at all. The whitespace stripping addresses suppliers that insert line break characters every 80 characters. **If you are experiencing parse errors with vendor messages, ask the vendor to correct their output.** The plugin copes with some cases, but clean messages are preferred.
 
 ### 5.3 Invoice Processing Differences
 
@@ -389,7 +419,10 @@ The plugin **completely replaces** standard Koha invoice processing. Key behavio
 | **Invoice adjustments** | Not created from EDI | Optional: rules create adjustments from MOA amounts, filtered on the segments governing each amount |
 | **Tax on shipping** | Not calculated | Optional: adds vendor tax rate to shipping charge |
 | **Shipping budget** | From vendor EDI account setting | Configurable: static ID, from order line, or vendor account setting |
-| **Standing orders** | Not specifically handled | Creates partial receipt keeping `quantity_remaining = 1` to keep order open |
+| **Standing orders** | Not specifically handled | Always receives as a part receipt so the standing order line stays open (remaining quantity = ordered less invoiced) |
+| **Cancelled orders** | Received, and the order set back to `complete` (core bug 43756) | Skipped (logged only) |
+| **Invoice without GIR** | Items not matched or transferred (core bug 43755) | Falls back to the items still on the order (changes after 4.5.1) |
+| **Error recording** | Rows in `edifact_errors`, shown on the EDIFACT messages and invoice pages | Log output only; nothing is written to `edifact_errors` |
 | **Duplicate receipts** | May fail or double-receive | Optional: skips already-received lines |
 | **Price recalculation** | Uses raw invoice values | Optional: recalculates using vendor tax settings |
 | **Invoice closing** | Manual | Optional: auto-close on receipt |
@@ -398,9 +431,11 @@ The plugin **completely replaces** standard Koha invoice processing. Key behavio
 
 | Feature | Standard Koha | Plugin |
 |---------|--------------|--------|
-| **Date accessioned** | Set on receipt | Set on receipt |
+| **Barcode from `GIR+LAC`** | Assigned when the item has none and the barcode is unused | Not assigned |
+| **Item matching** | By `GIR+LLO` branch | The first items linked to the received order, up to the invoiced quantity |
+| **Date accessioned** | Not set on EDI receipt (a manual receive does set it; core bug 43754) | Set to today on receipt |
 | **Bookseller ID** | Not set on item | Set to the vendor's ID (source of acquisition) |
-| **Price fields** | Both `price` and `replacementprice` updated | Configurable: update both, neither, or individually |
+| **Price fields** | Neither `price` nor `replacementprice` updated on EDI receipt (core bug 43754) | Configurable: update both (default), neither, or individually |
 | **Not-for-loan status** | Not changed | Optional: set to a specific authorized value |
 | **Item notes** | Not changed | Optional: add "Received via EDIFACT" note |
 | **LIN field clearing** | Not applicable | Optional: clear the item field used as LIN identifier |
@@ -529,11 +564,13 @@ GIR+1+001:LLO+ADULT-NF:LFN+BOOK:LST+REFERENCE:LSQ+823.914:LSM'
 
 ### Vendor Messages Failing to Parse
 
-**Symptom:** Incoming QUOTES, ORDRSP, or INVOIC messages fail with parse errors.
+**Symptom:** Incoming QUOTES, ORDRSP, or INVOIC messages fail with parse errors, or an invoice is downloaded but nothing is created.
 
-**Likely cause:** The vendor inserts line break characters every 80 characters in their EDIFACT output.
+**Likely causes:**
+- The vendor inserts line break characters every 80 characters in their EDIFACT output.
+- The interchange begins with a syntax version 4 service string advice (`UNA:+.?*'`) or has no `UNA`. Core Koha mishandles both (bug 43757); the plugin copes with both, but only for **invoices**.
 
-**Solution:** Ask the vendor to disable line-break insertion. The plugin handles this more gracefully than standard Koha (it strips whitespace and non-printable characters), but clean messages are preferred.
+**Solution:** For invoices the plugin handles these more gracefully than standard Koha (it ignores the fifth `UNA` character, assumes printable separators when `UNA` is absent, and strips whitespace and non-printable characters). For quotes and order responses the core parser is always used, so ask the vendor to send `UNA:+.? '` and no line breaks.
 
 ### LIN Identifier Not Matching Expected Value
 
@@ -542,6 +579,10 @@ GIR+1+001:LLO+ADULT-NF:LFN+BOOK:LST+REFERENCE:LSQ+823.914:LSM'
 **Explanation:** The plugin uses a priority cascade. The first source that returns a valid value wins. Check the priority order in [Section 4.3](#43-lin-segment--line-item-identification) and verify which source is matching first.
 
 **Debugging:** Check the raw EDIFACT message in the Koha EDIFACT messages log (under the Acquisitions module) to see what was actually sent.
+
+### Where Are the Plugin's Errors?
+
+Core Koha records invoice problems in `edifact_errors`, so they appear on the EDIFACT messages page and the invoice page. The plugin's invoice processing does **not** write to that table; skipped lines (unknown order, cancelled order, vendor mismatch) are reported only in the Koha logs, and downloads and uploads are recorded in the action log (module `EDIFACT`). Check both when an invoice processes with fewer receipts than expected.
 
 ### Invoices Not Processing
 
@@ -583,4 +624,24 @@ All configuration changes are recorded in the Koha action log under module `EDIF
 
 ---
 
-*This document describes the EDIFACT Enhanced Plugin version 4.x for Koha 22.05.06+. For the plugin source code, see the [GitHub repository](https://github.com/bywatersolutions/koha-plugin-edifact-enhanced/). For the standard Koha EDIFACT specification, see [EDI Supplier Guide](EDI_Supplier_Guide.md).*
+---
+
+## 9. Core Changes the Plugin Does Not Follow
+
+The plugin keeps its own copies of the order generator, parser, transport and invoice processor. The following changes to core Koha (up to 26.06) are therefore **not** reflected in plugin behaviour:
+
+| Core change | Effect on a plugin account |
+|-------------|----------------------------|
+| `GIR+LSL` and the `EdifactLSL` / `EdifactLSQ` preferences (bug 40391) | The plugin sends `LSQ` from the item's `location` and never sends `LSL` |
+| Servicing instructions: `aqorders.servicing_instruction`, `EDIFACT_SI`, `GIR+LVC` / `LVT` (bug 30144) | The plugin sends the vendor note as `LVT` and never `LVC` |
+| Account setting *Use purchase order numbers*, with escaping and duplicate checks (bugs 20253, 42010) | The plugin uses its own `send_basketname`, unescaped; quote import still honours the account setting |
+| `22V` order code for BIC vendors after a quote | The plugin always sends `220` |
+| Per-invoice rows in `edifact_errors` (bug 41996) and the already-complete-order warning | Never produced |
+| Logging through the `edi` `Koha::Logger` interface (bugs 41851, 42993) | The plugin transport uses `carp` and the action log |
+| Cancelling order lines from an ORDRSP (bug 42789) | Unaffected: order responses are always processed by core |
+
+Conversely, several plugin behaviours cover gaps in core Koha that have been reported upstream: item updates on receipt (bug 43754), invoices without `GIR` (bug 43755), cancelled orders on invoices (bug 43756), and parser handling of the service string advice (bug 43757). See the [Known Core Issues](EDI_Supplier_Guide.md#16-known-core-issues) section of the supplier guide.
+
+---
+
+*This document describes the EDIFACT Enhanced Plugin version 4.5.1 for Koha 25.11+, checked against Koha main (26.06). For the plugin source code, see the [GitHub repository](https://github.com/bywatersolutions/koha-plugin-edifact-enhanced/). For the standard Koha EDIFACT specification, see [EDI Supplier Guide](EDI_Supplier_Guide.md).*

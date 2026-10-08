@@ -13,12 +13,18 @@ Communication) conventions for the book supply chain.
 
 It is based on:
 
-- **Koha 25.11** — `Koha/EDI.pm`, `Koha/Edifact/Message.pm`, `Koha/Edifact/Line.pm`,
-  `Koha/Edifact/Order.pm`, `misc/cronjobs/edi_cron.pl`.
-- **EDIFACT Enhanced plugin 4.3.3** (ByWater Solutions), which replaces order generation,
-  transport, parsing and invoice processing when enabled on a vendor EDI account. For
+- **Koha main (26.06)** — `Koha/EDI.pm`, `Koha/Edifact.pm`, `Koha/Edifact/Message.pm`,
+  `Koha/Edifact/Line.pm`, `Koha/Edifact/Order.pm`, `Koha/Edifact/Transport.pm`,
+  `misc/cronjobs/edi_cron.pl`. Checked against main at commit `541cbd84a53`
+  (2026-09-22). Behaviour that differs from Koha 25.11 is marked *(26.06)*.
+- **EDIFACT Enhanced plugin 4.5.1** (ByWater Solutions), which replaces order generation,
+  invoice download and invoice processing when enabled on a vendor EDI account. For
   plugin configuration options see the companion
   [EDI Enhanced Plugin Guide](EDI_Enhanced_Plugin_Guide.md).
+
+Where core Koha currently behaves in a way that is a defect rather than a design choice,
+the text says so and cites the bug number; these are collected in
+[Section 16](#16-known-core-issues).
 
 ---
 
@@ -65,6 +71,7 @@ It is based on:
 - [13. Required-Element Summary](#13-required-element-summary)
 - [14. Common Failure Modes](#14-common-failure-modes)
 - [15. Plugin Extension Points](#15-plugin-extension-points)
+- [16. Known Core Issues](#16-known-core-issues)
 
 ---
 
@@ -103,15 +110,25 @@ rows in the `edifact_messages` table before they are processed:
 | Invoice | `INVOICE` | `.CEI` | `Koha::EDI::process_invoice` (or the plugin's `edifact_process_invoice`) |
 | Order response | `ORDRSP` | `.CEA` | `Koha::EDI::process_ordrsp` |
 
-Each downloaded message moves through three statuses: `new` → `processing` → `received`.
+Each downloaded message normally moves through three statuses: `new` → `processing` →
+`received`. A quote that had line-level problems ends as `error`, and when a quote file
+contains several messages, the second and later ones are stored as extra rows with status
+`recmsg`. Outgoing orders are stored as `Pending` and become `sent` once uploaded.
+Problems found while processing are written to `edifact_errors` and are visible from the
+EDIFACT messages page (and, for invoices, from the invoice page).
 
-The cron cycle per EDI account is:
+The cron cycle (`edi_cron.pl`) is:
 
-1. Download new QUOTE files
-2. Download new INVOICE files
-3. Upload pending ORDERS files
-4. Download new ORDRSP files
-5. Process all downloaded messages
+1. For each EDI account: download new QUOTE files, download new INVOICE files, upload
+   pending ORDERS files, download new ORDRSP files (each only if enabled on the account)
+2. Process all downloaded quotes
+3. Process all downloaded invoices (only if `EdifactInvoiceImport` is `automatic`)
+4. Process all downloaded order responses
+
+Files are fetched through the **file transport** (FTP/SFTP server record) selected on the
+EDI account; see [Section 10](#10-file-naming-and-transport). A downloaded file is renamed on
+the server by replacing the first character of its three-character extension with `E`
+(`.CEI` → `.EEI`) so that it is not fetched again.
 
 Two important control points govern inbound processing:
 
@@ -119,11 +136,14 @@ Two important control points govern inbound processing:
   `automatic`.** When it is `manual`, invoice rows stay at status `new` until a staff
   member triggers them from the acquisitions EDI messages page. Quotes and order responses
   are **always** processed by the cron run regardless of this preference.
-- **Order responses always use the core Koha parser and core processor.**
-  `process_ordrsp` instantiates `Koha::Edifact` directly and does not call any plugin
-  hook. Only invoice processing (and, separately, order generation and transport) is
-  replaceable by a plugin. So the ORDRSP behavior in [Section 6](#6-ordrsp--order-response-supplier-to-koha)
-  is identical whether or not a vendor account has a plugin configured.
+- **Quotes and order responses always use the core Koha parser and core processor.**
+  `process_quote` and `process_ordrsp` instantiate `Koha::Edifact` directly and call no
+  plugin hook, and their files are downloaded with the core transport. Only order
+  generation, **invoice** download and invoice processing can be replaced by a plugin (see
+  [Section 15](#15-plugin-extension-points)). So the QUOTES behavior in
+  [Section 5](#5-quotes--quotation-supplier-to-koha) and the ORDRSP behavior in
+  [Section 6](#6-ordrsp--order-response-supplier-to-koha) are identical whether or not a
+  vendor account has a plugin configured.
 
 ---
 
@@ -148,9 +168,26 @@ This **must** be present and use the standard separators exactly as shown:
 | ` ` | 5 | Reserved (space) |
 | `'` | 6 | Segment terminator |
 
-Non-standard separator characters are **not** supported. (The Enhanced plugin's parser
-tolerates a missing `UNA` and strips stray whitespace / non-printable characters; core
-Koha does not.)
+Non-standard separator characters are **not** supported.
+
+**Syntax version 4.** In UN/EDIFACT syntax version 3 the fifth `UNA` character is reserved
+and must be a space. In syntax version 4 it is the *repetition separator* (default `*`),
+so a conformant version 4 interchange begins `UNA:+.?*'`. Koha never uses repetition. The
+Enhanced plugin's parser accepts any character in that position. **Core Koha does not**: it
+only accepts the exact string `UNA:+.? '`, and a version 4 `UNA` currently causes the whole
+file to be discarded without an error ([Section 16](#16-known-core-issues), bug 43757).
+Suppliers should send `UNA:+.? '` with `UNB+UNOC:3`, as shown in the examples here.
+
+**Missing `UNA`.** For character sets other than `UNOA`/`UNOB` (including `UNOC`, which Koha
+uses), the ISO 9735 default separators are non-printable control characters, so an
+interchange that uses the printable separators `: + . ? '` is required to carry a `UNA`.
+Core Koha raises an error when `UNA` is missing (and, at present, that error stops the
+whole `edi_cron.pl` run; see bug 43757). The Enhanced plugin instead assumes the printable
+defaults and parses on. That is a leniency for suppliers that omit `UNA`; it is not
+something the standard guarantees. Likewise the plugin strips leading whitespace and
+non-printable characters from each segment, which copes with suppliers that put a line
+break after every segment terminator; ISO 9735 does not allow line breaks in an
+interchange, so suppliers should not send them.
 
 ### 3.2 Interchange Header (UNB)
 
@@ -199,6 +236,11 @@ character:
 | `:` | `?:` |
 | `+` | `?+` |
 
+Koha applies this escaping to outgoing text, including the PO number in `BGM` and the values
+in `GIR` *(26.06, bugs 41709 and 42010)*. Note that Koha transliterates the finished outgoing
+message to ASCII, and a typographic apostrophe (U+2019) becomes a plain `'` *after* escaping,
+so it is not escaped (bug 41789, open). The Enhanced plugin converts U+2019 before escaping.
+
 ### 3.6 Reading the Element Notation
 
 Throughout this document, "element N" means the Nth `+`-delimited field after the segment
@@ -239,7 +281,8 @@ NAD+SU+<supplier_san>::<agency>'
   │ IMD+L+170+:::<year>'
   │ IMD+L+220+:::<binding>'
   │ QTY+21:<quantity>'
-  │ GIR+<copy_no>+<branch>:LLO+<fund>:LFN+<itype>:LST+<seq>:LSQ+<shelfmark>:LSM'
+  │ GIR+<copy_no>+<fund>:LFN+<branch>:LLO+<itype>:LST+<seq>:LSQ+<subloc>:LSL+<shelfmark>:LSM'
+  │ GIR+<copy_no>+<instr_code>:LVC+<instr_text>:LVT'   (continuation, if servicing instructions)
   │ FTX+LIN+++<vendor_note>'
   │ PRI+AAE:<price>:CA'
   │ RFF+LI:<ordernumber>'
@@ -278,8 +321,18 @@ BGM+<document_type>+<document_number>+<function>'
 | `9` | Original message |
 | `7` | Retransmission |
 
-The document number is the Koha basket number (or basket name if the EDI account has
-`po_is_basketname` enabled, or the plugin's `send_basketname` is set).
+The document number is the Koha basket number, zero-padded to 11 digits, **or** the basket
+name when the EDI account has **Use purchase order numbers** (`po_is_basketname`) enabled
+(or, with the plugin, its own `send_basketname` option; the plugin does not read the
+account setting). The name is escaped *(26.06)*.
+
+With `po_is_basketname`, Koha also guards against re-using a purchase order number for the
+same vendor: a quote whose `RFF+ON` matches an existing basket name is still imported but an
+error is recorded and the basket is **not** auto-ordered, and generating an order for a basket
+whose name duplicates another basket's is refused *(26.06, bug 20253)*.
+
+The `22V` code is only used when the order follows a quote **and** the EDI account's
+standard is `BIC`; the plugin's order generator always sends `220`.
 
 #### DTM — Date/Time
 
@@ -379,12 +432,25 @@ with the same copy sequence number is emitted.
 
 | Qualifier | Data |
 |-----------|------|
-| `LLO` | Branch/location code (library branch receiving the item) |
 | `LFN` | Fund/budget code |
+| `LLO` | Branch/location code (library branch receiving the item) |
 | `LST` | Stock category / item type |
-| `LSQ` | Shelving sequence / collection code |
+| `LSQ` | Sequence code: the item field chosen by the `EdifactLSQ` preference (default `location`) |
+| `LSL` | Sub-location code: the item field chosen by the `EdifactLSL` preference (default `ccode`) *(26.06, bug 40391)* |
 | `LSM` | Shelfmark / call number |
-| `LVT` | Servicing instruction (free text) |
+| `LVC` | Coded servicing instruction (EDItEUR list 3B) *(26.06, bug 30144)* |
+| `LVT` | Servicing instruction (free text) *(26.06, bug 30144)* |
+
+The qualifiers appear in the order listed (that is the order Koha emits them), the copy
+sequence number is written as three digits (`GIR+001`), and empty values are omitted.
+`LVC`/`LVT` come from the order line's `servicing_instruction` (an earlier quote's
+`GIR+LVC`/`GIR+LVT`), not from the vendor note, and the same instructions are repeated on
+every copy's `GIR`.
+
+When the basket does not create items at ordering (`AcqCreateItem` is not `ordering`), the
+`GIR` values come from the record rather than from items: item type from the biblio item,
+call number from its classification, and branch from the basket's delivery place, once per
+ordered copy.
 
 See [Section 8](#8-gir-qualifiers--copy-level-data) for the complete qualifier table.
 
@@ -571,7 +637,30 @@ QTY+1:<quantity>'
 
 Same qualifier scheme as ORDERS. See [Section 8](#8-gir-qualifiers--copy-level-data). The
 `LFN` (fund allocation) qualifier is particularly important — Koha uses it to determine
-which budget/fund to charge.
+which budget/fund to charge. A line whose fund code does not match an *active* budget
+period's `budget_code` is skipped and an error is recorded.
+
+How the other qualifiers are used when Koha creates items from the quote (`AcqCreateItem` =
+`ordering`):
+
+| Qualifier | Becomes |
+|-----------|---------|
+| `LLO` | home and holding branch |
+| `LST` | item type |
+| `LSM`, else `LCL`, else the title-level Dewey/LC class | call number |
+| `LSQ` | the item field set by the `EdifactLSQ` preference (default `location`) |
+| `LSL` | the item field set by the `EdifactLSL` preference (default `ccode`) |
+| `LRP` | adds the item to the stock rotation rota with that title |
+| `LVC` | servicing instruction code; must be a value of the `EDIFACT_SI` authorised value category, otherwise the value is dropped and an error recorded |
+| `LVT` | servicing instruction free text |
+
+`LSQ` and `LSL` values are checked against the `LOC` or `CCODE` authorised values
+(whichever field the preference selects). An unknown value is not rejected: it is ignored,
+an error is recorded, and the item is still created *(26.06)*.
+
+When a line has more than one `GIR`, Koha expects the number of `GIR` segments to equal the
+`QTY` and creates one order line per distinct fund (counting copies with the same fund
+together). Only the servicing instructions of the first copy in each new order line are kept.
 
 #### PRI — Price
 
@@ -589,6 +678,12 @@ RFF+QLI:<supplier_quote_line_reference>'
 
 - `QLI` = quotation line item — the supplier's unique reference for this quoted item
 - Koha stores this and echoes it back in subsequent ORDERS messages
+- If a line has no `QLI`, an `RFF+SLI` (supplier's order line reference) is stored instead and
+  echoed back with the `SLI` qualifier
+
+Quote processing also needs a buyer `NAD+BY` whose EAN matches a Library EAN configured in
+Koha when the vendor account has **auto orders** enabled: the matching EAN is used to
+generate the order automatically, and if none matches no order is created.
 
 ### 5.3 IMD-to-MARC Mapping
 
@@ -614,11 +709,20 @@ ships or invoices. Koha uses it for exactly two outcomes per line:
 1. **Cancel the order line** in Koha (when the supplier says the line is cancelled), or
 2. **Record a supplier report** on the order line (for every other status), storing the
    supplier's coded status text and any availability date in the order's `suppliers_report`
-   field.
+   field (each response *replaces* the previous report).
 
-An order response never receives items and never touches money — it only updates order
-status/notes. It is always processed by core Koha (`process_ordrsp`); plugins do not
-override it.
+An order response never receives items and never touches money. A **cancellation**, however,
+is the full Koha order cancellation (`Koha::Acquisition::Order->cancel`) *(26.06, bug 42789)*,
+which also:
+
+- deletes the items linked to the order line (an item that cannot be deleted, for example
+  because it has holds, is kept and a warning is logged),
+- returns a linked suggestion from `ORDERED` to `ACCEPTED`, and
+- keeps the original cancellation date if the order was already cancelled.
+
+The bibliographic record is never deleted. An `RFF+LI` that matches no order is logged as an
+error and skipped. An order response is always processed by core Koha (`process_ordrsp`);
+plugins do not override it.
 
 ### 6.2 Message Structure
 
@@ -719,7 +823,7 @@ The `LIN` action code (element 1) drives the behavior:
 
 | Action Code | Meaning | Koha behavior |
 |-------------|---------|---------------|
-| `2` | Cancelled | **The order line is cancelled.** `orderstatus` set to `cancelled`, `datecancellationprinted` set to today, and `cancellationreason` set to the coded FTX text. |
+| `2` | Cancelled | **The order line is cancelled** (see [6.1](#61-what-an-order-response-does-in-koha)): `orderstatus` set to `cancelled`, `datecancellationprinted` set to today (if not already set), `cancellationreason` set to the coded FTX text, and the linked items are deleted. |
 | `3` | Change requested | Recorded only — coded text (+ availability date) written to `suppliers_report`. |
 | `4` | No action | Recorded only. |
 | `5` | Accepted | Recorded only. |
@@ -835,7 +939,7 @@ UNB+UNOC:3+5013546027856:14+9876543210123:14+250116:0902+RSP0001++ORDRSP'
 UNH+1+ORDRSP:D:96A:UN:EAN005'
 BGM+231+RESP-778+9'
 DTM+137:20250116:102'
-RFF+ON+B-2025-88'
+RFF+ON:B-2025-88'
 NAD+BY+9876543210123::9'
 NAD+SU+5013546027856::9'
 CUX+2:USD:9'
@@ -862,8 +966,8 @@ What Koha does with it:
 - **Line 1 (order 4123, action `5` accepted):** records a supplier report of "In stock"
   (`IB` via table `8B`). Order status unchanged.
 - **Line 2 (order 4124, action `2` cancelled):** cancels the order line. `orderstatus`
-  becomes `cancelled`, cancellation date is today, and the cancellation reason is stored as
-  "Out of print" (`OP` via `8B`).
+  becomes `cancelled`, cancellation date is today, the cancellation reason is stored as
+  "Out of print" (`OP` via `8B`), and any items created for the order line are deleted.
 - **Line 3 (order 4125, action `5` accepted):** records a supplier report of "Backordered -
   awaiting supply" (`400` via `12B`) with " Available: 20250301" appended.
 
@@ -876,11 +980,16 @@ What Koha does with it:
 Processing one `INVOIC` message causes Koha to:
 
 1. Create (or, under the plugin, reuse) an **aqinvoice** record keyed on the invoice
-   number, with a shipment date, billing date and shipment cost.
+   number, with a shipment date, billing date and shipment cost. Core Koha creates a new
+   invoice every time a message is processed, so a re-sent invoice is duplicated
+   (see bug 41297, which adds duplicate detection).
 2. For each invoice line, find the **Koha order** it refers to and **receive** the stated
    quantity against it — either a full receipt or a partial receipt that splits the order.
 3. Set the received order's unit price and tax from the invoice amounts.
-4. Assign barcodes to received items and set the date accessioned.
+4. Assign barcodes from `GIR+LAC` to received items that have none, and apply
+   `AcqItemSetSubfieldsWhenReceived`. Core Koha does **not** update any other item field on
+   receipt (no `dateaccessioned`, `booksellerid`, price or replacement price, unlike a
+   manual receive; bug 43754). The Enhanced plugin does.
 5. Mark any linked purchase suggestion as `AVAILABLE`.
 
 The invoice is the message that moves money and moves items from "on order" to "received".
@@ -1030,7 +1139,13 @@ RFF+LI:4123'
 - **This is the single most important element in the whole message.** It is how the invoice
   line is matched to an open order. If it is missing, the line is skipped with
   `Skipped invoice line <n>, missing ordernumber`. If it points to an order that does not
-  exist, the line is skipped with `cannot find order with ordernumber <n>`.
+  exist, the line is skipped with `cannot find order with ordernumber <n>`. A line whose
+  order has no bibliographic record is skipped with `cannot find biblio for ordernumber <n>`.
+  If the order is already `complete`, the line is **still received**, but a warning is
+  recorded (`... already marked as complete ... The ordernumber in this invoice may be
+  incorrect`). A line for a **cancelled** order is also received, silently, and the order
+  becomes `complete` again (bug 43756). All of these entries are recorded against the
+  invoice number *(26.06, bug 41996)*.
 - The related qualifiers `QLI` (supplier quote-line reference) and `SLI` (supplier
   order-line reference) are parsed but not used for invoice matching.
 
@@ -1044,7 +1159,9 @@ QTY+47:2'
 - **Behavior:** Koha uses the `47` quantity if present, otherwise the generic quantity. This
   number decides how many copies are received:
   - **Less than** the ordered quantity → a **partial receipt** (see [7.6](#76-how-items-are-received)).
-  - **Equal to** the ordered quantity → the line is received in full and marked `complete`.
+  - **Equal to or greater than** the ordered quantity → the line is received in full and
+    marked `complete`, with `quantityreceived` set to the invoiced quantity (an
+    over-supply is not flagged).
 
 #### MOA — monetary amounts (required for correct pricing)
 
@@ -1118,7 +1235,15 @@ GIR+1+9781234567890:LAC+MPL:LLO'
 
 Other GIR qualifiers (fund `LFN`, item type `LST`, shelfmark `LSM`, etc.) are recognized by
 the parser but are primarily used on outbound orders; on invoices only `LLO` and `LAC`
-change item data. `FTX` and `IMD` are parsed on invoice lines but do not drive receipt
+change item data.
+
+**Invoices with no `GIR`.** `GIR` is optional on an invoice and some suppliers never send it.
+Core Koha identifies the items belonging to an invoice line only through the `LLO` branch,
+so without `GIR` the line is still received at order level but no item is matched: each
+copy produces a `No matching item found ...` error, none of the receipt-time item updates
+are applied, and on a part receipt the items stay linked to the original order instead of
+moving to the new completed one (bug 43755). The Enhanced plugin falls back to the items
+still linked to the order. `FTX` and `IMD` are parsed on invoice lines but do not drive receipt
 behavior.
 
 #### RFF+DQ / ALC / PCD (line level)
@@ -1147,7 +1272,7 @@ correct.
 
 ### 7.6 How items are received
 
-- **Full receipt** (`invoiced == ordered`): the order line is updated in place —
+- **Full receipt** (`invoiced >= ordered`): the order line is updated in place —
   `quantityreceived` set, `orderstatus` → `complete`, prices and dates set, and items
   received (barcodes assigned, records updated).
 - **Partial receipt** (`invoiced < ordered`): the original order is reduced by the invoiced
@@ -1156,11 +1281,18 @@ correct.
   branch (`LLO`), then received.
 - **Item matching:** received copies are grouped by home branch; for each invoiced copy
   (walking the `GIR` occurrences) an item is pulled from the matching branch bucket. If the
-  invoiced branch has no unreceived item, it logs
-  `No matching item found for invoice line <n>:<copy> at branch <branch>`.
+  invoiced branch has no unreceived item, it records
+  `No matching item found for invoice line <n>:<copy> at branch <branch> (order <n> has items
+  at: <branches>). Check whether the ordernumber in the invoice (RFF+LI) is correct.`
+  *(26.06, bug 41996)*. An `aqorders_items` link to an item that no longer exists is
+  reported as `Koha item with itemnumber <n> is missing`. With no `GIR` at all, no item can
+  be matched (bug 43755).
 - **Suggestions:** if the order's biblio is linked to a purchase suggestion, its status is
   set to `AVAILABLE`.
 - **`AcqItemSetSubfieldsWhenReceived`** is honored when `AcqCreateItem` is `ordering`.
+- **`AcqCreateItem` = `receiving`:** items are not created from the invoice's `GIR`; the
+  invoice only updates items that already exist on the order (bug 42890 proposes creating
+  them).
 
 ### 7.7 Full worked example
 
@@ -1231,12 +1363,16 @@ changes these behaviors:
   existing one by invoice number + bookseller (+ message id). A retransmitted invoice updates
   the existing Koha invoice instead of duplicating it.
 - **Cancelled orders are skipped** — a line whose Koha order is already `cancelled` is not
-  received.
+  received (core Koha receives it and re-opens the order, bug 43756). The skip is only
+  written to the log; the plugin records nothing in `edifact_errors`.
 - **Cross-vendor tolerance.** If the order's basket vendor differs from the invoice vendor,
   the line is still received when both vendor accounts use the same plugin class; otherwise
   the message is handed back for the correct account.
-- **Standing orders** always receive as a partial (keeping one copy remaining) so the
-  standing order stays open.
+- **Standing orders** are always received as a partial receipt, so the standing order line
+  stays open. The remaining quantity is the ordered quantity less the invoiced quantity.
+- **Part receipt with no `GIR`.** When an invoice line has no `GIR`, the plugin uses the
+  home branches of the items still on the order so that the item links move to the new
+  completed order (in the plugin's unreleased changes after 4.5.1; 4.4.1 added the item-link transfer when `GIR` is present).
 - **Shipment charge is opt-in per `MOA` qualifier** (`shipment_charges_moa_8` / `_79` /
   `_124` / `_131` / `_304`), and the plugin scans the whole message, not just the header. An
   `ALC` is not required for an amount to be seen; the qualifier alone decides.
@@ -1250,11 +1386,16 @@ changes these behaviors:
   named in the rules. A rule can also filter on the segments governing the amount, so several
   charges sharing one qualifier can be told apart by the `ALC` in front of each, and a rule
   can route its amounts to the invoice shipping cost instead of an adjustment.
-- **Item receipt** is done by the plugin's own `_receipt_items`, which additionally sets the
+- **Item receipt** is done by the plugin's own `_receipt_items`, which updates up to the
+  invoiced quantity of the items linked to the received order and additionally sets the
   item's `booksellerid` (source of acquisition), `dateaccessioned`, and (per config)
   `price`/`replacementprice`, a not-for-loan value (`set_nfl_on_receipt`), an
   `itemnotes_nonpublic` of "Received via EDIFACT", and can clear the LIN-source item field.
+  It does **not** match items by `GIR` branch and does **not** assign barcodes from
+  `GIR+LAC`, so a supplier that relies on invoice barcodes needs the core processor.
 - **Optional close.** `close_invoice_on_receipt` sets the invoice `closedate` when done.
+- **Error reporting.** The plugin does not write `edifact_errors` rows; problems appear only
+  in the Koha logs, so the invoice page and EDIFACT messages page will not show them.
 
 The **required** elements are the same as core Koha — `RFF+LI`, a quantity, and line amounts
 are needed regardless of plugin. The plugin mainly changes vendor matching, duplicate
@@ -1287,13 +1428,19 @@ continuation GIR with the same copy sequence number is used.
 | `LRP` | Rotation plan | Library rotation plan |
 | `LRS` | Record sublocation | Record sublocation |
 | `LSC` | Statistical category | Statistical category |
+| `LSL` | Sub-location code | Sub-location; stored in the item field chosen by the `EdifactLSL` preference *(26.06)* |
 | `LSM` | Shelfmark | Call number / shelfmark |
-| `LSQ` | Sequence code | Shelving sequence / collection code |
+| `LSQ` | Sequence code | Shelving sequence / collection code; stored in the item field chosen by the `EdifactLSQ` preference |
 | `LST` | Stock category | Item type code |
 | `LSZ` | Size code | Physical size code |
-| `LVC` | Coded servicing instruction | Coded servicing instruction |
-| `LVT` | Servicing instruction | Free-text servicing instruction |
+| `LVC` | Coded servicing instruction | Coded servicing instruction; must be an `EDIFACT_SI` authorised value *(26.06)* |
+| `LVT` | Servicing instruction | Free-text servicing instruction *(26.06)* |
 | `RIC` | Reader interest category | Reader interest category |
+
+Koha recognises exactly the qualifiers above. An unrecognised qualifier is skipped with a
+warning in the log. Of the recognised ones, Koha currently acts on `LAC`, `LCL`, `LFN`,
+`LLO`, `LRP`, `LSL`, `LSM`, `LSQ`, `LST`, `LVC` and `LVT` (and, on invoices, only `LAC` and
+`LLO`); the rest are parsed and ignored.
 
 ### Most Commonly Used Qualifiers
 
@@ -1302,7 +1449,8 @@ continuation GIR with the same copy sequence number is used.
 | `LLO` | Recommended | Must match a Koha branch code |
 | `LFN` | Recommended | Must match a Koha budget/fund code |
 | `LST` | Optional | Must match a Koha item type code |
-| `LSQ` | Optional | Shelving sequence or collection code |
+| `LSQ` | Optional | Shelving sequence; goes to the item field set by `EdifactLSQ` (default `location`) |
+| `LSL` | Optional | Sub-location; goes to the item field set by `EdifactLSL` (default `ccode`) |
 | `LSM` | Optional | Call number |
 | `LAC` | Optional (INVOIC) | Barcode — assigned to received items |
 
@@ -1332,19 +1480,25 @@ continuation GIR with the same copy sequence number is used.
 
 ## 10. File Naming and Transport
 
-### Transport Protocols
+### File Transports
 
-| Protocol | Description |
-|----------|-------------|
+*(Since Koha 25.11, bugs 35761 and 38489.)* An EDI account no longer stores its own host,
+user name, password and directories. Instead it points at a **file transport** (an FTP/SFTP
+server record defined once under Administration and shared with other Koha features):
+
+| Transport | Description |
+|-----------|-------------|
 | **SFTP** | SSH File Transfer Protocol (recommended) |
 | **FTP** | Standard FTP |
-| **FILE** | Local filesystem (for testing or same-server setups) |
+| **Local** | Local filesystem (for testing or same-server setups) |
 
-### Directory Structure
-
-Each EDI account is configured with:
+The file transport carries the host, port, credentials, and two directories:
 - A **download directory** — where the supplier places files for Koha to retrieve
 - An **upload directory** — where Koha places outgoing ORDERS files for the supplier
+
+An EDI account with no file transport cannot download or upload anything; the cron job logs
+`No file transport configured for EDI account <id>` and moves on. Transport failures are
+logged through the `edi` Koha::Logger interface *(bugs 41851 and 42993)*.
 
 ### File Extensions
 
@@ -1355,8 +1509,13 @@ Each EDI account is configured with:
 | `.CEA` | ORDRSP (incoming) |
 | `.CEI` | INVOIC (incoming) |
 
-The Enhanced plugin can override the incoming invoice match suffix (`invoice_file_suffix`)
-and the outgoing order suffix (`order_file_suffix`).
+Core Koha matches the extension case-sensitively. The Enhanced plugin can override the
+incoming **invoice** match suffix (`invoice_file_suffix`, matched case-insensitively and
+allowed to be empty) and the outgoing order suffix (`order_file_suffix`). It can also mark a
+downloaded file by appending `.dl` instead of changing the extension, and by default it
+skips a file whose name is already in `edifact_messages`. These plugin options apply to
+invoice download and order generation only; quote and order-response files always use the
+core suffixes.
 
 ### Processing Schedule
 
@@ -1386,8 +1545,9 @@ conversion automatically for outgoing messages.
 
 The supplier must provide:
 - Their SAN or EAN identifier and its qualifier type
-- FTP/SFTP connection credentials (host, username, password)
-- The download and upload directory paths on the server
+- FTP/SFTP connection credentials (host, port, username, password), which the library enters
+  in a file transport record
+- The download and upload directory paths on the server (also part of the file transport)
 
 The library will provide:
 - Their branch EAN/SAN identifiers (one per branch)
@@ -1410,6 +1570,28 @@ Koha supports two EDIFACT standard profiles:
 The choice of standard affects BGM codes in ORDERS messages (e.g., `22V` for quote-response
 orders is BIC-only).
 
+### Vendor EDI Account Settings
+
+Each vendor EDI account carries the settings that govern the exchange. Both parties should
+agree on the ones that affect the wire format.
+
+| Setting | Effect |
+|---------|--------|
+| SAN and ID code qualifier | Supplier identity in `UNB` and `NAD+SU`; qualifier one of `14`, `31B`, `91`, `92` |
+| Standard | `EDItEUR` or `BIC`; `BIC` enables `22V` on orders that follow a quote |
+| Quotes / Invoices / Orders / Responses enabled | Which of the four message types the cron job exchanges for this account |
+| File transport | FTP/SFTP/local server record used for download and upload |
+| Auto orders | Automatically generate and send the order (and close the basket) when a quote is imported |
+| Use purchase order numbers (`po_is_basketname`) | Quote `RFF+ON` becomes the basket name, and the basket name is sent as the order `BGM` number |
+| Shipment budget | Fund charged with the invoice shipment cost |
+| Plugin | Optional plugin class; see [Section 15](#15-plugin-extension-points) |
+
+Library EANs (`edifact_ean`) are configured separately, optionally per branch, and give the
+buyer identity used in `UNB` and `NAD+BY`.
+
+Two system preferences also matter: `EdifactInvoiceImport` (automatic or manual invoice
+import) and `EdifactLSQ` / `EdifactLSL` (which item field `GIR+LSQ` and `GIR+LSL` map to).
+
 ### Code Mappings
 
 The supplier and library must share and agree on values for:
@@ -1419,7 +1601,9 @@ The supplier and library must share and agree on values for:
 | Branch codes | `LLO` | Must match Koha branch codes exactly |
 | Fund codes | `LFN` | Must match Koha budget codes exactly |
 | Item type codes | `LST` | Must match Koha item type codes exactly |
-| Collection codes | `LSQ` | Must match values configured in Koha |
+| Sequence codes | `LSQ` | Values for the item field chosen by `EdifactLSQ` (default `location`); checked against the `LOC` or `CCODE` authorised values |
+| Sub-location codes | `LSL` | Values for the item field chosen by `EdifactLSL` (default `ccode`); checked likewise |
+| Servicing instruction codes | `LVC` | Must be in the `EDIFACT_SI` authorised value category (EDItEUR list 3B) |
 
 ### Minimum Required Segments (quick checklist)
 
@@ -1498,7 +1682,26 @@ intended action.
   sends match the codes Koha sent on the order.
 - **Line-break characters every 80 chars.** Some vendors wrap EDIFACT output. The Enhanced
   plugin parser strips leading whitespace and non-printable characters to cope; core Koha does
-  not. Prefer asking the vendor to disable line wrapping.
+  not. Prefer asking the vendor to disable line wrapping (ISO 9735 does not allow line breaks
+  in an interchange).
+- **Invoice arrives but nothing is created.** If the interchange begins with a syntax
+  version 4 `UNA` (`UNA:+.?*'`), core Koha parses it as zero messages and marks it `received`
+  with no error (bug 43757). Ask the supplier to send `UNA:+.? '`.
+- **`cron` stops partway / message stuck in `processing`.** A file with no `UNA` raises an
+  error that ends `edi_cron.pl` (bug 43757). Find the message in the EDIFACT messages page
+  and ask the supplier to correct it.
+- **Invoice without `GIR` leaves items unreceived.** The order is received, but each copy
+  logs `No matching item found` and items are not updated (bug 43755).
+- **Received items lack source of acquisition, accession date or prices (core).** Core
+  invoice receipt does not set them (bug 43754); the Enhanced plugin does.
+- **A cancelled order came back to life.** An invoice line for a cancelled order is received
+  and the order becomes `complete` (bug 43756).
+- **A supplier's ORDRSP cancellation deleted items.** Cancelling through an order response now
+  deletes the order's items *(26.06)*.
+- **Apostrophes break outgoing orders.** A typographic apostrophe in a title or basket name can
+  end a segment early after transliteration (bug 41789).
+- **Duplicate PO number.** With `po_is_basketname`, a repeated `RFF+ON` for a vendor imports
+  the quote but blocks auto-ordering and manual order generation until the name is changed.
 
 ---
 
@@ -1509,20 +1712,42 @@ account:
 
 | Plugin Method | Purpose |
 |--------------|---------|
-| `edifact_order` | Replace the standard ORDERS message generator |
-| `edifact_transport` | Replace the standard file transport |
-| `edifact` | Replace the standard EDIFACT parser for incoming QUOTES / INVOIC messages |
+| `edifact_order` | Replace the standard ORDERS message generator (used when an order is created) |
+| `edifact_transport` | Replace the file transport used to **download invoices** only; quote and ORDRSP downloads and order uploads always use the core transport |
 | `edifact_process_invoice` | Replace the standard invoice processing pipeline |
+| `edifact` | Replace the parser used by core invoice processing. Core only calls this when the plugin has no `edifact_process_invoice`; the Enhanced plugin calls it itself from within its own invoice processor |
 
-Note that **ORDRSP processing has no plugin hook** — order responses are always parsed and
-processed by core Koha. If a supplier's message format deviates from the standard described
+Note that **QUOTES and ORDRSP processing have no plugin hook** — they are always downloaded,
+parsed and processed by core Koha. If a supplier's message format deviates from the standard described
 here, a Koha plugin can be developed to handle the differences; see the
 [EDI Enhanced Plugin Guide](EDI_Enhanced_Plugin_Guide.md).
 
 ---
 
-*Generated from the Koha 25.11 source (`Koha/EDI.pm`, `Koha/Edifact/Message.pm`,
-`Koha/Edifact/Line.pm`, `Koha/Edifact/Order.pm`, `misc/cronjobs/edi_cron.pl`) and the EDIFACT
-Enhanced plugin 4.3.3. For plugin configuration options, see the
+---
+
+## 16. Known Core Issues
+
+These are defects in core Koha (as of main 26.06) that affect what suppliers see. Each has a
+Bugzilla bug; check its status before relying on the behaviour described here.
+
+| Bug | Summary | Section |
+|-----|---------|---------|
+| [43754](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=43754) | EDI invoice receipt does not set item `booksellerid`, `dateaccessioned`, `datelastseen`, price, `replacementprice` or `replacementpricedate` as a manual receive does | [7.1](#71-what-an-invoice-does-in-koha) |
+| [43755](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=43755) | Invoices without `GIR` leave items unmatched, and part receipts leave items on the original order | [7.4](#74-line-level-elements) |
+| [43756](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=43756) | An invoice line for a cancelled order is received and the order is set back to `complete` | [7.4](#74-line-level-elements) |
+| [43757](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=43757) | A syntax version 4 `UNA` yields zero messages silently; a missing `UNA` stops `edi_cron.pl` | [3.1](#31-service-string-advice-una) |
+| [41789](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=41789) | Transliteration of outgoing messages can introduce an unescaped apostrophe | [3.5](#35-text-escaping) |
+| [41297](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=41297) | Duplicate invoice numbers are not detected on EDI import | [7.1](#71-what-an-invoice-does-in-koha) |
+| [42890](https://bugs.koha-community.org/bugzilla3/show_bug.cgi?id=42890) | Invoices do not create items when `AcqCreateItem` is `receiving` | [7.6](#76-how-items-are-received) |
+
+---
+
+*Generated from the Koha main (26.06) source (`Koha/EDI.pm`, `Koha/Edifact.pm`,
+`Koha/Edifact/Message.pm`, `Koha/Edifact/Line.pm`, `Koha/Edifact/Order.pm`,
+`Koha/Edifact/Transport.pm`, `misc/cronjobs/edi_cron.pl`) at commit `541cbd84a53`, the
+EDIFACT Enhanced plugin 4.5.1, and the ISO 9735 service-segment profiles published by Odette
+(OS11) and GS1 (EANCOM). Verified by reading the code and by reproducing the behaviours in
+Section 16 against a test database. For plugin configuration options, see the
 [EDI Enhanced Plugin Guide](EDI_Enhanced_Plugin_Guide.md). For the most current information,
 consult the [Koha community manual](https://koha-community.org/manual/).*
